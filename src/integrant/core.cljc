@@ -1,6 +1,7 @@
 (ns integrant.core
   (:refer-clojure :exclude [ref read-string run!])
-  (:require #?(:clj [clojure.edn :as edn])
+  (:require #?(:clj  [clojure.edn :as edn]
+               :cljs [clojure.tools.reader.edn :as edn])
             [clojure.walk :as walk]
             [clojure.set :as set]
             [clojure.spec.alpha :as s]
@@ -8,29 +9,83 @@
             [weavejester.dependency :as dep]))
 
 (defprotocol RefLike
-  (ref-key [r] "Return the key of the reference."))
+  (ref-key [r] "Return the key of the reference.")
+  (ref-resolve [r config resolvef] "Return the resolved value."))
 
-(defrecord Ref    [key] RefLike (ref-key [_] key))
-(defrecord RefSet [key] RefLike (ref-key [_] key))
+(defonce
+  ^{:doc "Return a unique keyword that is derived from an ordered collection of
+  keywords. The function will return the same keyword for the same collection."
+    :arglists '([kws])}
+  composite-keyword
+  (memoize
+   (fn [kws]
+     (let [parts     (for [kw kws] (str (namespace kw) "." (name kw)))
+           prefix    (str (str/join "+" parts) "_")
+           composite (keyword "integrant.composite" (str (gensym prefix)))]
+       (doseq [kw kws] (derive composite kw))
+       composite))))
+
+(defn- invalid-ref-exception [ref]
+  (ex-info (str "Invalid reference: " ref ". Must be a qualified keyword or a "
+                "vector of qualified keywords.")
+           {:reason ::invalid-ref, :ref ref}))
 
 (defn- composite-key? [keys]
   (and (vector? keys) (every? qualified-keyword? keys)))
 
 (defn valid-config-key?
-  "Returns true if the key is a keyword or valid composite key."
+  "Return true if the key is a keyword or valid composite key."
   [key]
   (or (qualified-keyword? key) (composite-key? key)))
+
+(defn normalize-key
+  "Given a valid Integrant key, return a keyword that uniquely identifies it."
+  [key]
+  {:pre [(valid-config-key? key)]}
+  (if (composite-key? key) (composite-keyword key) key))
+
+(defn derived-from?
+  "Return true if a key is derived from candidate keyword or vector of
+  keywords."
+  [key candidate]
+  (let [key (normalize-key key)]
+    (if (vector? candidate)
+      (every? #(isa? key %) candidate)
+      (isa? key candidate))))
+
+(defn find-derived
+  "Return a seq of all entries in a map, m, where the key is derived from the
+  a candidate key, k. If there are no matching keys, nil is returned. The
+  candidate key may be a keyword, or vector of keywords."
+  [m k]
+  (seq (filter #(or (= (key %) k) (derived-from? (key %) k)) m)))
+
+(defrecord Ref [key]
+  RefLike
+  (ref-key [_] key)
+  (ref-resolve [_ config resolvef]
+    (let [[k v] (first (find-derived config key))]
+      (resolvef k v))))
+
+(defrecord RefSet [key]
+  RefLike
+  (ref-key [_] key)
+  (ref-resolve [_ config resolvef]
+    (set (for [[k v] (find-derived config key)]
+           (resolvef k v)))))
 
 (defn ref
   "Create a reference to a top-level key in a config map."
   [key]
-  {:pre [(valid-config-key? key)]}
+  (when-not (valid-config-key? key)
+    (throw (invalid-ref-exception key)))
   (->Ref key))
 
 (defn refset
   "Create a set of references to all matching top-level keys in a config map."
   [key]
-  {:pre [(valid-config-key? key)]}
+  (when-not (valid-config-key? key)
+    (throw (invalid-ref-exception key)))
   (->RefSet key))
 
 (defn ref?
@@ -51,22 +106,6 @@
 (defn- depth-search [pred? coll]
   (filter pred? (tree-seq coll? seq coll)))
 
-(defonce
-  ^{:doc "Return a unique keyword that is derived from an ordered collection of
-  keywords. The function will return the same keyword for the same collection."
-    :arglists '([kws])}
-  composite-keyword
-  (memoize
-   (fn [kws]
-     (let [parts     (for [kw kws] (str (namespace kw) "." (name kw)))
-           prefix    (str (str/join "+" parts) "_")
-           composite (keyword "integrant.composite" (str (gensym prefix)))]
-       (doseq [kw kws] (derive composite kw))
-       composite))))
-
-(defn- normalize-key [k]
-  (if (vector? k) (composite-keyword k) k))
-
 (defn- ambiguous-key-exception [config key matching-keys]
   (ex-info (str "Ambiguous key: " key ". Found multiple candidates: "
                 (str/join ", " matching-keys))
@@ -74,22 +113,6 @@
             :config config
             :key    key
             :matching-keys matching-keys}))
-
-(defn derived-from?
-  "Return true if a key is derived from candidate keyword or vector of
-  keywords."
-  [key candidate]
-  (let [key (normalize-key key)]
-    (if (vector? candidate)
-      (every? #(isa? key %) candidate)
-      (isa? key candidate))))
-
-(defn find-derived
-  "Return a seq of all entries in a map, m, where the key is derived from the
-  a candidate key, k. If there are no matching keys, nil is returned. The
-  candidate key may be a keyword, or vector of keywords."
-  [m k]
-  (seq (filter #(or (= (key %) k) (derived-from? (key %) k)) m)))
 
 (defn find-derived-1
   "Return the map entry in a map, m, where the key is derived from the keyword,
@@ -111,7 +134,7 @@
   derived dependencies. Takes the following options:
 
   `:include-refsets?`
-  : whether to include refsets in the dependency graph (defauls to true)"
+  : whether to include refsets in the dependency graph (defaults to true)"
   ([config]
    (dependency-graph config {}))
   ([config {:keys [include-refsets?] :or {include-refsets? true}}]
@@ -141,18 +164,16 @@
 (defn- reverse-dependent-keys [config keys]
   (reverse (find-keys config keys dep/transitive-dependents-set)))
 
-#?(:clj
-   (def ^:private default-readers {'ig/ref ref, 'ig/refset refset}))
+(def ^:private default-readers {'ig/ref ref, 'ig/refset refset})
 
-#?(:clj
-   (defn read-string
-    "Read a config from a string of edn. Refs may be denotied by tagging keywords
-     with #ig/ref."
-     ([s]
-      (read-string {:eof nil} s))
-     ([opts s]
-      (let [readers (merge default-readers (:readers opts {}))]
-        (edn/read-string (assoc opts :readers readers) s)))))
+(defn read-string
+  "Read a config from a string of edn. Refs may be denotied by tagging keywords
+  with #ig/ref."
+  ([s]
+   (read-string {:eof nil} s))
+  ([opts s]
+   (let [readers (merge default-readers (:readers opts {}))]
+     (edn/read-string (assoc opts :readers readers) s))))
 
 #?(:clj
    (defn- keyword->namespaces [kw]
@@ -212,20 +233,9 @@
             :config config
             :key key}))
 
-(defn- resolve-ref [config resolvef ref]
-  (let [[k v] (first (find-derived config (ref-key ref)))]
-    (resolvef k v)))
-
-(defn- resolve-refset [config resolvef refset]
-  (set (for [[k v] (find-derived config (ref-key refset))]
-         (resolvef k v))))
-
 (defn- expand-key [config resolvef value]
   (walk/postwalk
-   #(cond
-      (ref? %)    (resolve-ref config resolvef %)
-      (refset? %) (resolve-refset config resolvef %)
-      :else       %)
+   #(if (reflike? %) (ref-resolve % config resolvef) %)
    value))
 
 (defn- run-exception [system completed remaining f k v t]
